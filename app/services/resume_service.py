@@ -1,10 +1,11 @@
 """Resume validation, analysis, and catalog-based job matching."""
 
 from dataclasses import asdict, dataclass
-import json
 import logging
 import re
 from typing import Any
+
+from pydantic import BaseModel, ConfigDict
 
 from app.config.settings import Settings
 from app.prompts.resume_prompt import SYSTEM_PROMPT, build_resume_prompt
@@ -32,6 +33,41 @@ LEARNING_BY_SKILL = {
     "Git": "Practice feature branches, pull requests, and resolving a merge conflict.",
     "data visualization": "Create a concise dashboard that explains a dataset with clear chart choices.",
 }
+MIN_ROLE_MATCH_PERCENTAGE = 30
+
+OPENAI_RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "summary": {"type": "string"},
+        "technical_skills": {"type": "array", "items": {"type": "string"}},
+        "soft_skills": {"type": "array", "items": {"type": "string"}},
+        "experience_assessment": {"type": "string"},
+        "learning_suggestions": {"type": "array", "items": {"type": "string"}},
+        "resume_improvements": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": [
+        "summary",
+        "technical_skills",
+        "soft_skills",
+        "experience_assessment",
+        "learning_suggestions",
+        "resume_improvements",
+    ],
+    "additionalProperties": False,
+}
+
+
+class OpenAIResumeResponse(BaseModel):
+    """Validated response contract for the OpenAI analysis provider."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    summary: str
+    technical_skills: list[str]
+    soft_skills: list[str]
+    experience_assessment: str
+    learning_suggestions: list[str]
+    resume_improvements: list[str]
 
 
 @dataclass(frozen=True)
@@ -95,14 +131,14 @@ class ResumeAnalyzer:
         detected_soft = self._extract_skills(text, SOFT_SKILLS)
         if self.settings.openai_api_key:
             result = self._analyze_with_openai(text)
-            technical = self._clean_list(result.get("technical_skills"), 20) or detected_technical
+            technical = detected_technical
             soft = self._clean_list(result.get("soft_skills"), 12) or detected_soft
             provider = "OpenAI"
         else:
             result = self._analyze_offline(text, detected_technical, detected_soft)
             technical, soft, provider = detected_technical, detected_soft, "Offline"
 
-        recommendations = self._recommend_jobs(technical)
+        recommendations = self._recommend_jobs(detected_technical)
         missing = list(dict.fromkeys(skill for job in recommendations[:3] for skill in job.missing_skills))[:8]
         learning = self._clean_list(result.get("learning_suggestions"), 8)
         if not learning:
@@ -134,7 +170,14 @@ class ResumeAnalyzer:
                 client = OpenAI(api_key=self.settings.openai_api_key, timeout=30.0, max_retries=1)
             response = client.chat.completions.create(
                 model=self.settings.openai_model,
-                response_format={"type": "json_object"},
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "resume_analysis",
+                        "strict": True,
+                        "schema": OPENAI_RESPONSE_SCHEMA,
+                    },
+                },
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": build_resume_prompt(resume_text)},
@@ -142,10 +185,8 @@ class ResumeAnalyzer:
                 temperature=0.2,
             )
             content = response.choices[0].message.content
-            parsed = json.loads(content or "{}")
-            if not isinstance(parsed, dict):
-                raise ValueError("The AI response must be a JSON object.")
-            return parsed
+            parsed = OpenAIResumeResponse.model_validate_json(content or "")
+            return parsed.model_dump()
         except Exception as error:
             logger.warning("Resume analysis provider failed (%s).", type(error).__name__)
             raise ResumeAnalysisError(
@@ -156,17 +197,36 @@ class ResumeAnalyzer:
     def _analyze_offline(
         resume_text: str, technical_skills: list[str], soft_skills: list[str]
     ) -> dict[str, Any]:
-        words = re.findall(r"\b\w+\b", resume_text)
-        summary = (
-            f"Resume contains {len(words)} words and {len(technical_skills)} recognizable technical "
-            f"skills. The strongest initial role matches are ranked below."
+        role = ResumeAnalyzer._extract_role(resume_text)
+        education = ResumeAnalyzer._extract_education(resume_text)
+        experience = ResumeAnalyzer._assess_experience(resume_text)
+        summary_parts = []
+        if role:
+            summary_parts.append(f"Role indicated: {role}.")
+        experience_match = re.search(
+            r"\b(\d+(?:\.\d+)?)\s*(?:\+\s*)?years?\b", resume_text, re.IGNORECASE
         )
-        experience_match = re.search(r"\b(\d+(?:\.\d+)?)\s+years?\b", resume_text, re.IGNORECASE)
-        experience = (
-            f"The resume states {experience_match.group(1)} years of experience. "
-            "Add the scope, technologies, and measurable results for each position or project."
-            if experience_match
-            else "No clear duration of experience was detected. Add dates and measurable outcomes for roles and projects."
+        if experience_match:
+            summary_parts.append(f"The resume states {experience_match.group(1)} years of experience.")
+        else:
+            date_range_match = re.search(
+                r"\b((?:19|20)\d{2}\s*(?:-|\u2013|to)\s*(?:(?:19|20)\d{2}|present|current))\b",
+                resume_text,
+                re.IGNORECASE,
+            )
+            if date_range_match:
+                summary_parts.append(
+                    f"Dated experience entries include {date_range_match.group(1)}."
+                )
+        if technical_skills:
+            summary_parts.append(f"Recognized skills include {', '.join(technical_skills[:6])}.")
+        if soft_skills:
+            summary_parts.append(f"Interpersonal skills listed include {', '.join(soft_skills[:4])}.")
+        if education:
+            summary_parts.append(f"Education listed: {education.rstrip('. ')}.")
+        summary = " ".join(summary_parts) or (
+            "The resume does not clearly identify a role, education, experience duration, "
+            "or skills from the local recognition list."
         )
         return {
             "summary": summary,
@@ -176,6 +236,63 @@ class ResumeAnalyzer:
             "learning_suggestions": [],
             "resume_improvements": ResumeAnalyzer._default_improvements(resume_text),
         }
+
+    @staticmethod
+    def _extract_role(resume_text: str) -> str | None:
+        role_terms = (
+            "developer", "engineer", "analyst", "designer", "manager", "consultant",
+            "scientist", "administrator", "architect",
+        )
+        for line in resume_text.splitlines()[:10]:
+            candidate = line.strip()
+            if len(candidate) <= 100 and any(term in candidate.casefold() for term in role_terms):
+                return candidate
+        return None
+
+    @staticmethod
+    def _extract_education(resume_text: str) -> str | None:
+        education_terms = (
+            "bachelor", "master", "ph.d", "phd", "associate", "diploma", "degree",
+            "university", "college",
+        )
+        for line in resume_text.splitlines():
+            candidate = line.strip()
+            if candidate and any(term in candidate.casefold() for term in education_terms):
+                return candidate[:180]
+        return None
+
+    @staticmethod
+    def _assess_experience(resume_text: str) -> str:
+        years_match = re.search(
+            r"\b(\d+(?:\.\d+)?)\s*(?:\+\s*)?years?\b", resume_text, re.IGNORECASE
+        )
+        month_match = re.search(r"\b(\d+)\s+months?\b", resume_text, re.IGNORECASE)
+        date_ranges = re.findall(
+            r"\b((?:19|20)\d{2}\s*(?:-|\u2013|to)\s*(?:(?:19|20)\d{2}|present|current))\b",
+            resume_text,
+            re.IGNORECASE,
+        )
+        has_measurable_result = re.search(
+            r"\b\d+(?:\.\d+)?\s*(?:%|users?|customers?|requests?|tickets?|hours?|dollars?)",
+            resume_text,
+            re.IGNORECASE,
+        )
+
+        if years_match:
+            assessment = f"The resume states {years_match.group(1)} years of experience."
+        elif month_match:
+            assessment = f"The resume states {month_match.group(1)} months of experience."
+        elif date_ranges:
+            assessment = (
+                f"Dated experience ranges are present ({', '.join(date_ranges[:3])}); "
+                "total duration is not inferred because roles may overlap."
+            )
+        else:
+            assessment = "No explicit experience duration or year-to-year work dates were detected."
+
+        if has_measurable_result:
+            return assessment + " Review each result for its baseline and your specific contribution."
+        return assessment + " Add measurable outcomes and clarify your ownership of each project or role."
 
     def _recommend_jobs(self, skills: list[str]) -> list[JobRecommendation]:
         normalized_skills = {self._normalize(skill) for skill in skills}
@@ -202,7 +319,11 @@ class ResumeAnalyzer:
                     missing_skills=missing,
                 )
             )
-        return sorted(recommendations, key=lambda item: (-item.match_percentage, item.title))[:3]
+        return [
+            item
+            for item in sorted(recommendations, key=lambda item: (-item.match_percentage, item.title))
+            if item.match_percentage >= MIN_ROLE_MATCH_PERCENTAGE
+        ][:3]
 
     @staticmethod
     def _extract_skills(text: str, known_skills: tuple[str, ...]) -> list[str]:

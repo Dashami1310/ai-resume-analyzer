@@ -1,7 +1,10 @@
 """SQLite-backed catalog of job profiles used for local recommendations."""
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 import sqlite3
 from pathlib import Path
+from threading import RLock
 
 
 JOB_PROFILES: tuple[tuple[str, str, str], ...] = (
@@ -18,12 +21,28 @@ class JobCatalog:
 
     def __init__(self, database_path: Path) -> None:
         self.database_path = database_path
-        if str(database_path) != ":memory:":
+        self._memory_connection: sqlite3.Connection | None = None
+        self._memory_lock = RLock()
+        if str(database_path) == ":memory:":
+            self._memory_connection = sqlite3.connect(":memory:", check_same_thread=False)
+        else:
             database_path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize()
 
-    def _connect(self) -> sqlite3.Connection:
-        return sqlite3.connect(str(self.database_path))
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        if self._memory_connection is not None:
+            with self._memory_lock:
+                with self._memory_connection as connection:
+                    yield connection
+            return
+
+        connection = sqlite3.connect(str(self.database_path))
+        try:
+            with connection as managed_connection:
+                yield managed_connection
+        finally:
+            connection.close()
 
     def _initialize(self) -> None:
         with self._connect() as connection:

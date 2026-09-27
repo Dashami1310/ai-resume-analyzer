@@ -5,10 +5,12 @@ A Streamlit career tool that reviews pasted resume content, identifies skills, c
 ## Features
 
 - Resume summary, technical skills, soft skills, and experience assessment
-- Ranked job recommendations with matching and missing skills
+- Illustrative role matches against five local profiles, with matching and missing skills
+- Equal-weight skill-overlap scores; profiles below 30% are omitted
 - Learning suggestions and actionable resume improvements
 - JSON report download
 - Optional OpenAI-powered narrative analysis
+- Strictly schema-validated OpenAI responses; job matching uses locally detected technical skills
 - SQLite-backed, seeded role catalog; submitted resumes are not written to the database
 - Input limits, safe provider errors, and tests that make no network requests
 
@@ -74,7 +76,7 @@ Tests use temporary SQLite databases and an injected OpenAI mock. They do not ne
 - If PowerShell blocks environment activation, use `Set-ExecutionPolicy -Scope Process RemoteSigned` for the current terminal, or invoke `.venv\Scripts\python.exe` directly.
 - If `streamlit` is not found, activate the virtual environment and reinstall requirements.
 - If AI-assisted analysis fails, verify the API key and model; the app displays a generic provider error and does not log resume content.
-- The offline mode works without an OpenAI key and uses known-skill matching, so its feedback is intentionally heuristic.
+- The offline mode works without an OpenAI key and uses local rules for summary, skills, experience assessment, and matching, so its feedback is intentionally heuristic. Role matches are not live job vacancies. Their score is the share of a profile's listed skills detected in the resume; all skills have equal weight and results below 30% are hidden.
 
 ## Security and Privacy
 
