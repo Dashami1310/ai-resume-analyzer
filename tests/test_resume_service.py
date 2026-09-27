@@ -8,7 +8,11 @@ import pytest
 from app.config.settings import Settings
 from app.services.job_catalog import JobCatalog
 from app.services.resume_service import ResumeAnalysisError, ResumeAnalyzer
-from app.utils.analysis_state import analyze_and_replace
+from app.utils.analysis_state import (
+    OpenAIConsentRequired,
+    analyze_and_replace,
+    clear_session_data,
+)
 
 
 DEMO_RESUME = """Python Developer. Python, FastAPI, Git, Docker, MySQL, REST APIs.
@@ -73,6 +77,62 @@ def test_analysis_failure_invalidates_previous_analysis():
         analyze_and_replace(DEMO_RESUME, fail_analysis, session_state)
 
     assert "analysis" not in session_state
+
+
+def test_openai_consent_is_required_before_analyzer_is_called():
+    session_state = {"analysis": object(), "analysis_report": "old report"}
+    analyzer_called = False
+
+    def analyze(resume_text):
+        nonlocal analyzer_called
+        analyzer_called = True
+        return "new analysis"
+
+    with pytest.raises(OpenAIConsentRequired, match="sent to OpenAI"):
+        analyze_and_replace(
+            DEMO_RESUME,
+            analyze,
+            session_state,
+            require_openai_consent=True,
+            consent_acknowledged=False,
+        )
+
+    assert not analyzer_called
+    assert "analysis" not in session_state
+    assert "analysis_report" not in session_state
+
+
+def test_offline_analysis_does_not_require_openai_consent():
+    session_state = {}
+
+    result = analyze_and_replace(
+        DEMO_RESUME,
+        lambda resume_text: "offline analysis",
+        session_state,
+    )
+
+    assert result == "offline analysis"
+    assert session_state["analysis"] == result
+
+
+def test_clear_session_data_removes_resume_analysis_consent_and_reports():
+    session_state = {
+        "resume_text": DEMO_RESUME,
+        "analysis": object(),
+        "analysis_report": "report",
+        "generated_report": "generated",
+        "report": "legacy report",
+        "openai_consent": True,
+        "analysis_mode": "OpenAI-powered analysis",
+    }
+
+    clear_session_data(session_state)
+
+    assert session_state["resume_text"] == ""
+    assert session_state["analysis_mode"] == "Offline analysis"
+    assert not set(session_state).intersection(
+        {"analysis", "analysis_report", "generated_report", "report", "openai_consent"}
+    )
 
 
 def test_rejects_resume_over_configured_limit(tmp_path):

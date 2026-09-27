@@ -6,6 +6,7 @@ import json
 import streamlit as st
 
 from app.services.resume_service import ResumeAnalysis
+from app.utils.analysis_state import clear_session_data
 
 
 DESIGN_CSS = """
@@ -148,8 +149,18 @@ def apply_design_system() -> None:
     st.markdown(DESIGN_CSS, unsafe_allow_html=True)
 
 
-def render_sidebar(openai_enabled: bool) -> None:
-    """Render concise product, workflow, mode, and privacy information."""
+def _clear_session() -> None:
+    clear_session_data(st.session_state)
+
+
+def _invalidate_analysis_and_consent() -> None:
+    st.session_state.pop("analysis", None)
+    st.session_state.pop("analysis_report", None)
+    st.session_state.pop("openai_consent", None)
+
+
+def render_sidebar(openai_available: bool) -> bool:
+    """Render product, workflow, mode, and privacy information; return active mode."""
     with st.sidebar:
         st.markdown('<div class="brand-mark">AI</div>', unsafe_allow_html=True)
         st.markdown('<div class="sidebar-product">AI Resume Analyzer</div>', unsafe_allow_html=True)
@@ -159,16 +170,33 @@ def render_sidebar(openai_enabled: bool) -> None:
         st.markdown("1. Add resume text\n2. Review skills and experience\n3. Explore illustrative role matches")
         st.divider()
         st.markdown("**Analysis mode**")
-        if openai_enabled:
-            st.markdown("OpenAI-assisted")
-            st.caption("Narrative insights use the configured OpenAI model.")
+        if openai_available:
+            selected_mode = st.radio(
+                "Choose analysis mode",
+                ("Offline analysis", "OpenAI-powered analysis"),
+                key="analysis_mode",
+                on_change=_invalidate_analysis_and_consent,
+                label_visibility="collapsed",
+            )
+            openai_selected = selected_mode == "OpenAI-powered analysis"
+            if openai_selected:
+                st.caption("Resume text is sent to OpenAI only after you acknowledge in the input section.")
+            else:
+                st.caption("Local heuristics run without sending resume text to OpenAI.")
         else:
-            st.markdown("Offline heuristics")
-            st.caption("Local rules run without an OpenAI API key.")
+            openai_selected = False
+            st.markdown("Offline analysis")
+            st.caption("Local heuristics run because no OpenAI API key is configured.")
         st.divider()
         st.markdown("**Privacy**")
-        st.caption("Resume text is not saved to SQLite. OpenAI mode sends submitted text to OpenAI for analysis.")
+        st.caption("Resume text stays in this Streamlit session and is not written to SQLite or application logs.")
+        st.button(
+            "Clear current resume/session data",
+            on_click=_clear_session,
+            use_container_width=True,
+        )
         st.caption("Streamlit app · Local role catalog")
+    return openai_selected
 
 
 def render_hero() -> None:
@@ -193,18 +221,21 @@ def render_hero() -> None:
 
 def _load_sample_resume(sample_resume: str) -> None:
     st.session_state["resume_text"] = sample_resume
-    st.session_state.pop("analysis", None)
+    _invalidate_analysis_and_consent()
 
 
 def _invalidate_analysis() -> None:
     st.session_state.pop("analysis", None)
+    st.session_state.pop("analysis_report", None)
+    if "openai_consent" in st.session_state:
+        st.session_state["openai_consent"] = False
 
 
 def render_resume_input(
     max_characters: int,
-    openai_enabled: bool,
+    openai_selected: bool,
     sample_resume: str,
-) -> tuple[bool, str]:
+) -> tuple[bool, str, bool]:
     """Render the input editor and return the submit state and current text."""
     if "resume_text" not in st.session_state:
         st.session_state["resume_text"] = sample_resume
@@ -239,18 +270,26 @@ def render_resume_input(
         with counter_col:
             st.caption(f"{len(resume_text):,} / {max_characters:,} characters")
         with mode_col:
-            mode_text = (
-                "OpenAI-powered narrative analysis"
-                if openai_enabled
-                else "Offline heuristic analysis; no OpenAI request"
-            )
+            mode_text = "OpenAI-powered analysis" if openai_selected else "Offline heuristic analysis; no OpenAI request"
             st.caption(mode_text)
+        if openai_selected:
+            st.warning(
+                "OpenAI mode sends the resume text above to OpenAI for analysis. "
+                "Review the content before continuing."
+            )
+            consent_acknowledged = st.checkbox(
+                "I acknowledge that this resume will be sent to OpenAI for analysis.",
+                key="openai_consent",
+            )
+        else:
+            st.info("Offline analysis uses local rules. Resume text is not sent to OpenAI.")
+            consent_acknowledged = False
         submitted = st.button(
             "Analyze resume",
             type="primary",
             use_container_width=True,
         )
-    return submitted, resume_text
+    return submitted, resume_text, consent_acknowledged
 
 
 def _section_heading(title: str, description: str | None = None) -> None:
